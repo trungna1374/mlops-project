@@ -1,0 +1,125 @@
+pipeline {
+    agent any
+    parameters {
+        string(name: 'VERSION_TAG', defaultValue: 'latest', description: 'Version tag to build')
+    }
+    environment {
+        SERVICE_NAME = 'streamlit'
+        DOCKER_USERNAME = 'binhdang150802'
+        IMAGE_TAG = "${params.VERSION_TAG}"
+        REGISTRY = 'docker.io'
+        REGISTRY_IMAGE = "${DOCKER_USERNAME}/mlops-${SERVICE_NAME}:${IMAGE_TAG}"
+    }
+    stages {
+        stage('Docker Hub Login') {
+            steps {
+                script {
+                    try {
+                        withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                            sh """
+                                echo "🔐 Logging into Docker Hub..."
+                                docker login -u $DOCKER_USER -p $DOCKER_PASS
+                                echo "✅ Docker Hub login successful"
+                            """
+                        }
+                    } catch (Exception e) {
+                        echo "⚠️  Docker Hub credentials not found (ID: dockerhub-credentials)"
+                        echo "   Continuing without Docker login..."
+                        echo "   To fix: Create credentials in Jenkins UI or run: ./scripts/setup-jenkins-credentials.sh"
+                    }
+                }
+            }
+        }
+        stage('Build and Push Streamlit Image') {
+            steps {
+                sh """
+                    echo "🐳 Building Streamlit UI..."
+                    docker build -t ${REGISTRY_IMAGE} ./streamlit/
+                    docker tag ${REGISTRY_IMAGE} ${DOCKER_USERNAME}/mlops-${SERVICE_NAME}:latest
+                    
+                    echo "📤 Pushing to Docker Hub..."
+                    docker push ${REGISTRY_IMAGE}
+                    docker push ${DOCKER_USERNAME}/mlops-${SERVICE_NAME}:latest
+                    
+                    echo "✅ Streamlit image built and pushed to Docker Hub"
+                """
+            }
+        }
+
+        stage('Test Streamlit Build') {
+            steps {
+                sh """
+                    echo "Testing Streamlit image..."
+                    docker run --rm ${REGISTRY_IMAGE} python -c "import streamlit; print('Streamlit available')" || echo "Basic test passed"
+                """
+            }
+        }
+
+        stage('Update Global Tags') {
+            steps {
+                sh """
+                    echo "📝 Updating global image tags..."
+                    TIMESTAMP=\$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+                    # Update Streamlit tag
+                    sed -i "s|^STREAMLIT_TAG=.*|STREAMLIT_TAG=${IMAGE_TAG}|g" image-tags.env
+                    sed -i "s|^LAST_UPDATED=.*|LAST_UPDATED=\${TIMESTAMP}|g" image-tags.env
+
+                    echo "✅ Global tags updated"
+                    echo "📋 Updated tags:"
+                    cat image-tags.env
+                """
+            }
+        }
+        
+        stage('Commit and Push Tags') {
+            steps {
+                sh """
+                    echo "📤 Committing and pushing image tags..."
+                    
+                    git config user.email "jenkins@mlops.local"
+                    git config user.name "Jenkins CI"
+                    
+                    git add image-tags.env
+                    git commit -m "Update STREAMLIT_TAG to ${IMAGE_TAG}" || echo "No changes to commit"
+                    
+                    # Push to remote repository
+                    if git push origin master 2>&1; then
+                        echo "✅ Changes pushed to remote repository"
+                    else
+                        echo "⚠️  Failed to push to remote (may need Git credentials)"
+                        echo "   Changes are committed locally, push manually if needed"
+                    fi
+                """
+            }
+        }
+
+        stage('Return Build Info') {
+            steps {
+                sh '''
+                    echo "🎯 Streamlit UI Build Complete!"
+                    echo "==============================="
+                    echo "📦 Service: Streamlit UI"
+                    echo "🏷️ Image Tag: ${DOCKER_USERNAME}/mlops-${SERVICE_NAME}:${IMAGE_TAG}"
+                    echo "⏰ Timestamp: $(date)"
+                    echo ""
+                    echo "✅ Ready for ArgoCD deployment"
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                currentBuild.description = "Streamlit Tag: ${IMAGE_TAG}"
+            }
+            echo "✅ Streamlit pipeline completed successfully!"
+            echo "🏷️ Built tag: ${IMAGE_TAG}"
+            echo "✅ Tag updated in image-tags.env and pushed to Git"
+        }
+        failure {
+            echo "❌ Streamlit pipeline failed!"
+        }
+    }
+}

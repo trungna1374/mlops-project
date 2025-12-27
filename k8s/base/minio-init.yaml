@@ -1,0 +1,27 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: mlops
+spec:
+  template:
+    spec:
+      containers:
+      - name: init-minio
+        image: minio/mc:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "Waiting for MinIO to be ready..."
+          until mc alias set myminio http://minio:9000 minio minio123 2>/dev/null; do
+            echo "Retrying MinIO connection..."
+            sleep 2
+          done
+          echo "MinIO connected. Creating bucket..."
+          mc mb myminio/mlflow-artifacts --ignore-existing || true
+          echo "MinIO initialized with mlflow-artifacts bucket"
+          mc ls myminio/
+      restartPolicy: Never
+  backoffLimit: 4
+

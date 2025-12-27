@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-generator
+  namespace: mlops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: data-generator
+  template:
+    metadata:
+      labels:
+        app: data-generator
+    spec:
+      containers:
+        - name: data-generator
+          image: binhdang150802/mlops-data-generator:1.1.1
+          imagePullPolicy: Always
+          env:
+            - name: POSTGRES_HOST
+              value: "host.minikube.internal"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              value: "ecommerce_db"
+            - name: POSTGRES_USER
+              value: "mlflow"
+            - name: POSTGRES_PASSWORD
+              value: "mlflow"
+            - name: DATE_RANGE_DAYS
+              value: "90"
+            - name: GENERATION_INTERVAL
+              value: "10"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+

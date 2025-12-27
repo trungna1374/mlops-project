@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data
+data/raw/*.csv
+data/versions/*.csv
+*.parquet
+*.feather
+
+# Models
+models/*.pkl
+models/*.joblib
+mlruns/
+mlflow/
+
+# Environment
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# MLflow
+mlartifacts/
+
+# Monitoring
+evidently/data/
+simulations/*.csv
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# Large binaries (for GitOps setup)
+argocd-linux-amd64
+minikube-linux-amd64
+kustomize
+

@@ -1,0 +1,422 @@
+pipeline {
+    agent any
+    
+    parameters {
+        string(name: 'MODEL_TAG', defaultValue: '', description: 'Model tag/run_id to deploy (empty = train new model, or specify existing run_id like: 3f597f58219540768c47d304b29fe4df)')
+        string(name: 'VERSION_TAG', defaultValue: '3.10', description: 'Version tag for training Docker image (e.g., 3.10, v1.0.0, latest)')
+        string(name: 'RUN_NAME', defaultValue: '', description: 'Custom run name for MLflow (empty = auto-generated like training_20241225_123045)')
+        string(name: 'N_ESTIMATORS', defaultValue: '100', description: 'Number of trees in Random Forest')
+        string(name: 'MAX_DEPTH', defaultValue: '10', description: 'Maximum depth of trees')
+        string(name: 'PYTHON_VERSION', defaultValue: '3.10', description: 'Python version for training (used in Dockerfile)')
+    }
+    
+    environment {
+        SERVICE_NAME = 'model-training'
+        MODEL_NAME = 'ecommerce_classifier'
+        DOCKER_USERNAME = 'binhdt'
+        TRAINING_IMAGE = "${DOCKER_USERNAME}/mlops-training:${params.VERSION_TAG}"
+        
+        // Database config (Standalone Docker PostgreSQL)
+        POSTGRES_HOST = 'localhost'
+        POSTGRES_PORT = '5432'
+        POSTGRES_DB = 'ecommerce_db'
+        POSTGRES_USER = 'mlflow'
+        POSTGRES_PASSWORD = 'mlflow'
+        
+        // MLflow config
+        MLFLOW_TRACKING_URI = 'http://localhost:5000'
+        
+        // MinIO (S3) config for artifacts
+        // MinIO is in Kubernetes, will be set dynamically using Minikube IP
+        AWS_ACCESS_KEY_ID = 'minio'
+        AWS_SECRET_ACCESS_KEY = 'minio123'
+        MLFLOW_S3_IGNORE_TLS = 'true'
+    }
+    
+    stages {
+        stage('Setup Environment') {
+            steps {
+                script {
+                    // Determine if we're training new model or deploying existing one
+                    if (params.MODEL_TAG?.trim()) {
+                        env.MODEL_TAG_SPECIFIED = 'true'
+                        env.MODEL_RUN_ID = params.MODEL_TAG.trim()
+                        echo " Using specified MODEL_TAG: ${env.MODEL_RUN_ID}"
+                        echo "  Skipping training, will deploy existing model"
+                    } else {
+                        env.MODEL_TAG_SPECIFIED = 'false'
+                        echo " Will train new model and use its run_id"
+                    }
+                }
+                sh '''
+                    echo " Setting up environment..."
+                    echo "Model: ''' + MODEL_NAME + '''"
+                    echo "Training Image Tag: ''' + params.VERSION_TAG + '''"
+                    if [ "''' + env.MODEL_TAG_SPECIFIED + '''" = "true" ]; then
+                        echo "Model Tag: ''' + env.MODEL_RUN_ID + ''' (specified)"
+                    else
+                        echo "N Estimators: ''' + params.N_ESTIMATORS + '''"
+                        echo "Max Depth: ''' + params.MAX_DEPTH + '''"
+                        echo "Python Version: ''' + params.PYTHON_VERSION + '''"
+                    fi
+                '''
+            }
+        }
+        
+        stage('Build Training Image') {
+            when {
+                expression { !params.MODEL_TAG?.trim() }
+            }
+            steps {
+                sh '''
+                    echo " Building training Docker image..."
+                    cd scripts
+                    
+                    # Build with specified Python version
+                    docker build \
+                        --build-arg PYTHON_VERSION=''' + params.PYTHON_VERSION + ''' \
+                        -t ''' + TRAINING_IMAGE + ''' \
+                        -f Dockerfile .
+                    
+                    echo " Training image built: ''' + TRAINING_IMAGE + '''"
+                '''
+            }
+        }
+        
+        stage('Train Model in Docker') {
+            when {
+                expression { !params.MODEL_TAG?.trim() }
+            }
+            steps {
+                sh '''
+                    set +e  # Don't exit on errors, we'll handle them
+                    echo " Starting model training in Docker container..."
+                    
+                    # Get MinIO endpoint for artifact storage
+                    # Jenkins uses --network host, so localhost should work
+                    MINIO_ENDPOINT=""
+                    
+                    # Method 1: Check MinIO NodePort on localhost (Kubernetes)
+                    echo " Checking MinIO on localhost:30900 (Kubernetes NodePort)..."
+                    if curl -s --connect-timeout 2 http://localhost:30900/minio/health/live >/dev/null 2>&1; then
+                        MINIO_ENDPOINT="http://localhost:30900"
+                        echo "✅ Found MinIO on localhost:30900 (Kubernetes NodePort)"
+                    fi
+                    
+                    # Method 2: Check standalone MinIO on localhost:9000
+                    if [ -z "$MINIO_ENDPOINT" ]; then
+                        echo " Checking MinIO on localhost:9000 (standalone)..."
+                        if curl -s --connect-timeout 2 http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+                            MINIO_ENDPOINT="http://localhost:9000"
+                            echo "✅ Found MinIO on localhost:9000 (standalone)"
+                        fi
+                    fi
+                    
+                    # Method 3: Try to get Minikube IP and use NodePort
+                    if [ -z "$MINIO_ENDPOINT" ] && command -v minikube >/dev/null 2>&1; then
+                        echo " Trying to get Minikube IP..."
+                        MINIKUBE_OUTPUT=$(minikube ip 2>&1)
+                        MINIKUBE_IP=$(echo "$MINIKUBE_OUTPUT" | grep -oE "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}" | head -1)
+                        if [ -n "$MINIKUBE_IP" ] && [ "$MINIKUBE_IP" != "" ]; then
+                            MINIO_ENDPOINT="http://${MINIKUBE_IP}:30900"
+                            echo "✅ Found MinIO via Minikube IP: ${MINIO_ENDPOINT}"
+                            # Test if accessible
+                            if ! curl -s --connect-timeout 2 "${MINIO_ENDPOINT}/minio/health/live" >/dev/null 2>&1; then
+                                echo "  MinIO not accessible at ${MINIO_ENDPOINT}"
+                                MINIO_ENDPOINT=""
+                            fi
+                        fi
+                    fi
+                    
+                    # Method 4: Try kubectl to get node IP
+                    if [ -z "$MINIO_ENDPOINT" ] && command -v kubectl >/dev/null 2>&1; then
+                        echo "Trying to get Kubernetes node IP..."
+                        NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
+                        if [ -n "$NODE_IP" ] && [ "$NODE_IP" != "" ]; then
+                            MINIO_ENDPOINT="http://${NODE_IP}:30900"
+                            echo " Found MinIO via Kubernetes node IP: ${MINIO_ENDPOINT}"
+                            # Test if accessible
+                            if ! curl -s --connect-timeout 2 "${MINIO_ENDPOINT}/minio/health/live" >/dev/null 2>&1; then
+                                echo "  MinIO not accessible at ${MINIO_ENDPOINT}"
+                                MINIO_ENDPOINT=""
+                            fi
+                        fi
+                    fi
+                    
+                    # Final fallback: Use localhost:9000 (training will continue but artifacts may fail)
+                    if [ -z "$MINIO_ENDPOINT" ]; then
+                        MINIO_ENDPOINT="http://localhost:9000"
+                        echo " Using fallback MinIO endpoint: ${MINIO_ENDPOINT}"
+                        echo "  Note: MinIO may not be accessible. Artifacts will be stored locally if S3 fails."
+                    fi
+                    
+                    echo " MinIO endpoint: ${MINIO_ENDPOINT}"
+                    set -e  # Re-enable error exit for the rest of the script
+                    
+                    # Run training in Docker container
+                    # Note: train_model.py is already in the image at /app/train_model.py
+                    docker run --rm \
+                        --network host \
+                        -v $(pwd):/output \
+                        -e POSTGRES_HOST=''' + POSTGRES_HOST + ''' \
+                        -e POSTGRES_PORT=''' + POSTGRES_PORT + ''' \
+                        -e POSTGRES_DB=''' + POSTGRES_DB + ''' \
+                        -e POSTGRES_USER=''' + POSTGRES_USER + ''' \
+                        -e POSTGRES_PASSWORD=''' + POSTGRES_PASSWORD + ''' \
+                        -e MLFLOW_TRACKING_URI=''' + MLFLOW_TRACKING_URI + ''' \
+                        -e MLFLOW_S3_ENDPOINT_URL="${MINIO_ENDPOINT}" \
+                        -e AWS_ACCESS_KEY_ID=''' + AWS_ACCESS_KEY_ID + ''' \
+                        -e AWS_SECRET_ACCESS_KEY=''' + AWS_SECRET_ACCESS_KEY + ''' \
+                        -e MLFLOW_S3_IGNORE_TLS=''' + MLFLOW_S3_IGNORE_TLS + ''' \
+                        ''' + TRAINING_IMAGE + ''' \
+                        python train_model.py \
+                            --model-name ''' + MODEL_NAME + ''' \
+                            --n-estimators ''' + params.N_ESTIMATORS + ''' \
+                            --max-depth ''' + params.MAX_DEPTH + ''' \
+                            ''' + (params.RUN_NAME?.trim() ? '--run-name ' + params.RUN_NAME.trim() + ' \\' : '\\') + '''
+                            --postgres-host ''' + POSTGRES_HOST + ''' \
+                            --postgres-port ''' + POSTGRES_PORT + ''' \
+                            --postgres-db ''' + POSTGRES_DB + ''' \
+                            --postgres-user ''' + POSTGRES_USER + ''' \
+                            --postgres-password ''' + POSTGRES_PASSWORD + ''' \
+                            --mlflow-tracking-uri ''' + MLFLOW_TRACKING_URI + '''
+                    
+                    echo "✅ Training complete!"
+                '''
+            }
+        }
+        
+        stage('Get Model Run ID') {
+            when {
+                expression { !params.MODEL_TAG?.trim() }
+            }
+            steps {
+                script {
+                    // Try to get run_id from MLflow after training
+                    def runId = sh(script: '''
+                        # Wait a moment for MLflow to process
+                        sleep 3
+                        # Get the latest run for our experiment
+                        python3 -c "
+import mlflow
+import os
+os.environ['MLFLOW_TRACKING_URI'] = 'http://localhost:5000'
+client = mlflow.tracking.MlflowClient()
+experiment = client.get_experiment_by_name('ecommerce_model_training')
+if experiment:
+    runs = client.search_runs(experiment.experiment_id, max_results=1, order_by=['start_time DESC'])
+    if runs:
+        print(runs[0].info.run_id)
+    else:
+        print('latest')
+else:
+    print('latest')
+                        " 2>/dev/null || echo "latest"
+                    ''', returnStdout: true).trim()
+
+                    env.MODEL_RUN_ID = runId
+                    echo "📋 Model Run ID: ${runId}"
+                }
+            }
+        }
+        
+        stage('Validate Model Tag') {
+            when {
+                expression { params.MODEL_TAG?.trim() }
+            }
+            steps {
+                script {
+                    // Validate that the specified model tag exists in MLflow
+                    def isValid = sh(script: '''
+                        python3 -c "
+import mlflow
+import os
+import sys
+os.environ['MLFLOW_TRACKING_URI'] = 'http://localhost:5000'
+try:
+    client = mlflow.tracking.MlflowClient()
+    run_id = ''' + "'${env.MODEL_RUN_ID}'" + '''
+    # Try to get run info
+    run = client.get_run(run_id)
+    print('valid')
+except Exception as e:
+    print('invalid')
+    sys.exit(1)
+                        " 2>/dev/null || echo "invalid"
+                    ''', returnStdout: true).trim()
+                    
+                    if (isValid != 'valid') {
+                        echo "  Warning: Model tag '${env.MODEL_RUN_ID}' may not exist in MLflow"
+                        echo "   Will proceed anyway (API will handle validation)"
+                    } else {
+                        echo "✅ Model tag '${env.MODEL_RUN_ID}' validated in MLflow"
+                    }
+                }
+            }
+        }
+        
+        stage('Update Model Tag') {
+            steps {
+                sh '''
+                    echo "" Updating model tag..."
+                    
+                    MODEL_RUN_ID_VAL="''' + env.MODEL_RUN_ID + '''"
+                    
+                    # Update image-tags.env
+                    if ! grep -q "^MODEL_TAG=" image-tags.env; then
+                        echo "" >> image-tags.env
+                        echo "# ML Model Tag (MLflow Run ID)" >> image-tags.env
+                        echo "MODEL_TAG=latest" >> image-tags.env
+                    fi
+                    sed -i "s|^MODEL_TAG=.*|MODEL_TAG=${MODEL_RUN_ID_VAL}|g" image-tags.env
+                    sed -i "s|^LAST_UPDATED=.*|LAST_UPDATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")|g" image-tags.env
+                    
+                    # Update k8s/base/api.yaml directly
+                    if [ -f "k8s/base/api.yaml" ]; then
+                        sed -i "s|value: \".*\"|value: \"${MODEL_RUN_ID_VAL}\"|g" k8s/base/api.yaml
+                        echo "✅ Updated MODEL_TAG in k8s/base/api.yaml"
+                    fi
+                    
+                    echo "✅ Model tag updated:"
+                    echo "   image-tags.env: MODEL_TAG=${MODEL_RUN_ID_VAL}"
+                    if [ -f "k8s/base/api.yaml" ]; then
+                        API_TAG_VALUE=$(grep -A 1 'MODEL_TAG' k8s/base/api.yaml | grep value | cut -d'"' -f2)
+                        echo "   k8s/base/api.yaml: MODEL_TAG=${API_TAG_VALUE}"
+                    fi
+                '''
+            }
+        }
+        
+        stage('Commit Model Tag') {
+            steps {
+                sh '''
+                    echo " Committing model tag to Git..."
+                    
+                    git config user.email "jenkins@mlops.local"
+                    git config user.name "Jenkins CI"
+                    
+                    git add image-tags.env
+                    if [ -f "k8s/base/api.yaml" ]; then
+                        git add k8s/base/api.yaml
+                    fi
+                    
+                    if [ "''' + env.MODEL_TAG_SPECIFIED + '''" = "true" ]; then
+                        COMMIT_MSG="Deploy model with tag: ''' + env.MODEL_RUN_ID + '''"
+                    else
+                        COMMIT_MSG="Update MODEL_TAG to ''' + env.MODEL_RUN_ID + ''' (new training)"
+                    fi
+                    
+                    git commit -m "${COMMIT_MSG}" || echo "No changes to commit"
+                    
+                    # Push to remote repository
+                    # The remote URL already contains the GitHub token for authentication
+                    echo " Pushing changes to remote repository..."
+                    if git push origin master 2>&1; then
+                        echo "" Changes pushed to remote repository"
+                    else
+                        echo "  Failed to push to remote (may need Git credentials)"
+                        echo "   Changes are committed locally, push manually if needed"
+                        echo "   Run: git push origin master"
+                    fi
+                '''
+            }
+        }
+        
+        stage('Display Model Tag') {
+            steps {
+                script {
+                    // Set build description to show model tag prominently
+                    currentBuild.description = "Model Tag: ${env.MODEL_RUN_ID}"
+                    
+                    // Also display prominently in console
+                    echo ""
+                    echo "╔══════════════════════════════════════════════════════════════════════════╗"
+                    echo "║                     MODEL TAG FOR DEPLOYMENT                           ║"
+                    echo "╚══════════════════════════════════════════════════════════════════════════╝"
+                    echo ""
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo " MODEL TAG (Run ID): ${env.MODEL_RUN_ID}"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo ""
+                    echo "✅ This tag has been:"
+                    echo "   1. Updated in image-tags.env"
+                    echo "   2. Updated in k8s/base/api.yaml"
+                    echo "   3. Committed to Git"
+                    echo "   4. Pushed to remote repository"
+                    echo ""
+                    echo " ArgoCD will automatically sync and deploy this model"
+                    echo ""
+                }
+            }
+        }
+        
+        stage('Training Summary') {
+            steps {
+                sh '''
+                    echo ""
+                    echo "========================================="
+                    echo "🎯 MODEL TRAINING COMPLETE!"
+                    echo "========================================="
+                    echo "Model Name: ''' + MODEL_NAME + '''"
+                    echo "Model Tag/Run ID: ''' + env.MODEL_RUN_ID + '''"
+                    if [ "''' + env.MODEL_TAG_SPECIFIED + '''" = "true" ]; then
+                        echo "Mode: Deploy existing model (tag specified)"
+                    else
+                        echo "Mode: Train new model"
+                        echo "N Estimators: ''' + params.N_ESTIMATORS + '''"
+                        echo "Max Depth: ''' + params.MAX_DEPTH + '''"
+                        echo "Python Version: ''' + params.PYTHON_VERSION + '''"
+                        echo "Training Image Tag: ''' + params.VERSION_TAG + '''"
+                        echo "Training Image: ''' + TRAINING_IMAGE + '''"
+                        echo "✅ Model registered in MLflow"
+                    fi
+                    echo "MLflow UI: ''' + MLFLOW_TRACKING_URI + '''"
+                    echo ""
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "📋 MODEL TAG: ''' + env.MODEL_RUN_ID + '''"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo ""
+                    echo "✅ Model tag updated and pushed to Git"
+                    echo "✅ ArgoCD will automatically sync and deploy"
+                    echo ""
+                    echo "Next steps:"
+                    echo "1. Check MLflow UI for model metrics: ''' + MLFLOW_TRACKING_URI + '''"
+                    echo "2. Wait for ArgoCD to sync (check ArgoCD UI)"
+                    echo "3. API pod will restart with new MODEL_TAG"
+                    echo "4. Test predictions: curl http://localhost:8000/model-info"
+                    echo "========================================="
+                '''
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                // Display model tag in build summary
+                def modelTag = env.MODEL_RUN_ID ?: 'N/A'
+                echo ""
+                echo "╔══════════════════════════════════════════════════════════════════════════╗"
+                echo "║                    ✅ PIPELINE COMPLETED SUCCESSFULLY                     ║"
+                echo "╚══════════════════════════════════════════════════════════════════════════╝"
+                echo ""
+                echo "📋 MODEL TAG: ${modelTag}"
+                echo ""
+                echo "✅ Changes pushed to Git"
+                echo "✅ ArgoCD will auto-sync"
+                echo "✅ API will deploy with this model tag"
+                echo ""
+            }
+        }
+        failure {
+            echo "❌ Model training pipeline failed!"
+            echo "Check console output for errors"
+        }
+        always {
+            script {
+                echo "🧹 Cleaning up..."
+                // Clean up any temporary files if needed
+            }
+        }
+    }
+}

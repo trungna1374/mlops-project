@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: mlops
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+  selector:
+    app: api
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: mlops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: binhdang150802/mlops-api:1.1.15
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: "http://192.168.49.1:5000"
+            - name: MODEL_NAME
+              value: "ecommerce_classifier"
+            - name: MODEL_TAG
+              value: "74dd63425ddf45079b9fb5e4ad2ea475"
+            - name: AWS_ACCESS_KEY_ID
+              value: "minio"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "minio123"
+            - name: MLFLOW_S3_ENDPOINT_URL
+              value: "http://192.168.49.1:9000"
+            - name: MLFLOW_S3_IGNORE_TLS
+              value: "true"
+            - name: POSTGRES_HOST
+              value: "192.168.49.1"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              value: "ecommerce_db"
+            - name: POSTGRES_USER
+              value: "mlflow"
+            - name: POSTGRES_PASSWORD
+              value: "mlflow"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
